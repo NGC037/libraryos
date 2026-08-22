@@ -17,3 +17,7 @@ export * from "./schema/identity-access/user-account";
 export * from "./schema/identity-access/role";
 export * from "./schema/identity-access/membership";
 export * from "./schema/identity-access/permission";
+export * from "./schema/catalog/work";
+export * from "./schema/catalog/edition";
+export * from "./schema/inventory-wayfinding/copy";
+export * from "./schema/inventory-wayfinding/location";

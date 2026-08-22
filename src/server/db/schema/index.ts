@@ -5,3 +5,7 @@ export * from "./identity-access/user-account";
 export * from "./identity-access/role";
 export * from "./identity-access/membership";
 export * from "./identity-access/permission";
+export * from "./catalog/work";
+export * from "./catalog/edition";
+export * from "./inventory-wayfinding/copy";
+export * from "./inventory-wayfinding/location";
