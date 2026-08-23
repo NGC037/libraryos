@@ -7,6 +7,7 @@ import {
   loans,
   circulationEvents,
   memberships,
+  memberLogEvents,
 } from "@/server/db/schema";
 import { eq, and, sql } from "drizzle-orm";
 import { resolveCirculationPolicy } from "@/server/policy-engine/evaluate";
@@ -150,6 +151,18 @@ export const circulationRouter = router({
           },
         });
 
+        await tx.insert(memberLogEvents).values({
+          personId: input.personId,
+          eventType: "loan_checked_out",
+          actorUserAccountId: ctx.userAccountId!,
+          summary: `Checked out copy ${copy.barcode}`,
+          metadata: {
+            loanId: loan.id,
+            copyId: copy.id,
+            dueAt: dueAt.toISOString(),
+          },
+        });
+
         return { loan, replayed: false };
       });
     }),
@@ -221,6 +234,14 @@ export const circulationRouter = router({
           eventType: "return",
           actorUserAccountId: ctx.userAccountId!,
           idempotencyKey: input.idempotencyKey,
+        });
+
+        await tx.insert(memberLogEvents).values({
+          personId: activeLoan.personId,
+          eventType: "loan_returned",
+          actorUserAccountId: ctx.userAccountId!,
+          summary: `Returned copy ${copy.barcode}`,
+          metadata: { loanId: activeLoan.id, copyId: copy.id },
         });
 
         const [updatedLoan] = await tx

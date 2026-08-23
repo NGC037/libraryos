@@ -12,3 +12,6 @@ export * from "./inventory-wayfinding/location";
 export * from "./circulation/loan";
 export * from "./circulation/circulationEvent";
 export * from "./tenancy/policy";
+export * from "./identity-access/onboardingApplication";
+export * from "./identity-access/credential";
+export * from "./identity-access/memberLogEvent";
