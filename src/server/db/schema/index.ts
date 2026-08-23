@@ -9,3 +9,5 @@ export * from "./catalog/work";
 export * from "./catalog/edition";
 export * from "./inventory-wayfinding/copy";
 export * from "./inventory-wayfinding/location";
+export * from "./circulation/loan";
+export * from "./circulation/circulationEvent";
