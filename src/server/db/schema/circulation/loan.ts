@@ -3,6 +3,7 @@ import { organizations } from "../tenancy/organization";
 import { branches } from "../tenancy/branch";
 import { copies } from "../inventory-wayfinding/copy";
 import { people } from "../identity-access/person";
+import { policyVersions } from "../tenancy/policy";
 
 export const loanStatusValues = [
   "active",
@@ -27,7 +28,10 @@ export const loans = pgTable("loans", {
     .references(() => copies.id),
   personId: uuid("person_id")
     .notNull()
-    .references(() => people.id), // the borrower
+    .references(() => people.id),
+  policyVersionId: uuid("policy_version_id").references(
+    () => policyVersions.id,
+  ), // §8: which rules governed this loan
   status: text("status", { enum: loanStatusValues })
     .notNull()
     .default("active"),

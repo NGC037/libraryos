@@ -2,23 +2,25 @@ import { z } from "zod";
 import { TRPCError } from "@trpc/server";
 import { router, orgProcedure } from "@/server/api/trpc";
 import { db } from "@/server/db";
-import { copies, loans, circulationEvents } from "@/server/db/schema";
-import { eq, and } from "drizzle-orm";
-
-const LOAN_PERIOD_DAYS = 14; // hardcoded default; Policy Studio (§4.1) replaces this later
+import {
+  copies,
+  loans,
+  circulationEvents,
+  memberships,
+} from "@/server/db/schema";
+import { eq, and, sql } from "drizzle-orm";
+import { resolveCirculationPolicy } from "@/server/policy-engine/evaluate";
 
 export const circulationRouter = router({
   checkout: orgProcedure
     .input(
       z.object({
         barcode: z.string(),
-        personId: z.string().uuid(), // the borrower
+        personId: z.string().uuid(),
         idempotencyKey: z.string(),
       }),
     )
     .mutation(async ({ ctx, input }) => {
-      // Idempotency check FIRST, outside the transaction — a retried request
-      // returns the original result instead of erroring or duplicating (§8: "barcode scanned twice or network retried")
       const [existingEvent] = await db
         .select()
         .from(circulationEvents)
@@ -50,15 +52,72 @@ export const circulationRouter = router({
           throw new TRPCError({ code: "NOT_FOUND", message: "Copy not found" });
 
         if (copy.status !== "available") {
-          // §8: "two staff scan the same copy" / general conflict — explain, don't silently fail
           throw new TRPCError({
             code: "CONFLICT",
             message: `Copy is currently "${copy.status}", not available for checkout`,
           });
         }
 
+        // §3: eligibility depends on the member's actual membership record — status, member type
+        const [membership] = await tx
+          .select()
+          .from(memberships)
+          .where(
+            and(
+              eq(memberships.personId, input.personId),
+              eq(memberships.organizationId, ctx.organizationId!),
+            ),
+          )
+          .limit(1);
+
+        if (!membership) {
+          throw new TRPCError({
+            code: "FORBIDDEN",
+            message: "No membership found for this person in this organization",
+          });
+        }
+
+        // §4.1: resolve the most specific applicable policy (branch/member-type/resource-type override org defaults)
+        const policy = await resolveCirculationPolicy({
+          organizationId: ctx.organizationId!,
+          branchId: copy.branchId,
+          memberType: membership.memberType,
+          resourceType: "book",
+        });
+
+        if (!policy) {
+          throw new TRPCError({
+            code: "PRECONDITION_FAILED",
+            message: "No circulation policy configured for this organization",
+          });
+        }
+
+        // §15.3 "Explain before asking" — every rejection names WHY, not just "action failed"
+        if (
+          !policy.rules.eligibleMembershipStatuses.includes(membership.status)
+        ) {
+          throw new TRPCError({
+            code: "FORBIDDEN",
+            message: `Membership status "${membership.status}" is not eligible to borrow under the current policy`,
+          });
+        }
+
+        const [{ count }] = await tx
+          .select({ count: sql<number>`count(*)::int` })
+          .from(loans)
+          .where(
+            and(eq(loans.personId, input.personId), eq(loans.status, "active")),
+          );
+
+        if (count >= policy.rules.maxActiveLoans) {
+          throw new TRPCError({
+            code: "FORBIDDEN",
+            message: `Member already has ${count} active loan(s), at or above the policy limit of ${policy.rules.maxActiveLoans}`,
+          });
+        }
+
         const dueAt = new Date();
-        dueAt.setDate(dueAt.getDate() + LOAN_PERIOD_DAYS);
+        dueAt.setDate(dueAt.getDate() + policy.rules.loanPeriodDays);
 
         const [loan] = await tx
           .insert(loans)
@@ -67,6 +126,7 @@ export const circulationRouter = router({
             branchId: copy.branchId,
             copyId: copy.id,
             personId: input.personId,
+            policyVersionId: policy.policyVersionId,
             status: "active",
             dueAt,
           })
@@ -84,7 +144,10 @@ export const circulationRouter = router({
           eventType: "checkout",
           actorUserAccountId: ctx.userAccountId!,
           idempotencyKey: input.idempotencyKey,
-          metadata: { dueAt: dueAt.toISOString() },
+          metadata: {
+            dueAt: dueAt.toISOString(),
+            policyVersionId: policy.policyVersionId,
+          },
         });
 
         return { loan, replayed: false };
@@ -136,8 +199,6 @@ export const circulationRouter = router({
           .limit(1);
 
         if (!activeLoan) {
-          // §8: "a return is recorded after a member is suspended" — return should still be
-          // acceptable even in odd account states; here we just handle "no active loan" distinctly
           throw new TRPCError({
             code: "CONFLICT",
             message: "No active loan found for this copy",

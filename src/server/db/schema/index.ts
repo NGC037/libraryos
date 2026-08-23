@@ -11,3 +11,4 @@ export * from "./inventory-wayfinding/copy";
 export * from "./inventory-wayfinding/location";
 export * from "./circulation/loan";
 export * from "./circulation/circulationEvent";
+export * from "./tenancy/policy";
