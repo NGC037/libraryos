@@ -4,6 +4,7 @@ import { circulationRouter } from "./circulation";
 import { onboardingRouter } from "./onboarding";
 import { memberLogCardRouter } from "./memberLogCard";
 import { credentialsRouter } from "./credentials";
+import { holdsRouter } from "./holds";
 
 export const appRouter = router({
   ping: publicProcedure.query(() => "pong"),
@@ -13,7 +14,7 @@ export const appRouter = router({
   onboarding: onboardingRouter,
   memberLogCard: memberLogCardRouter,
   credentials: credentialsRouter,
+  holds: holdsRouter,
 });
 
 export type AppRouter = typeof appRouter;
-  

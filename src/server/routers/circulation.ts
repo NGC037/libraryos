@@ -8,9 +8,13 @@ import {
   circulationEvents,
   memberships,
   memberLogEvents,
+  holds,
+  editions,
 } from "@/server/db/schema";
 import { eq, and, sql } from "drizzle-orm";
 import { resolveCirculationPolicy } from "@/server/policy-engine/evaluate";
+
+const PICKUP_WINDOW_DAYS = 3;
 
 export const circulationRouter = router({
   checkout: orgProcedure
@@ -222,10 +226,49 @@ export const circulationRouter = router({
           .update(loans)
           .set({ status: "returned", returnedAt: new Date() })
           .where(eq(loans.id, activeLoan.id));
-        await tx
-          .update(copies)
-          .set({ status: "available", updatedAt: new Date() })
-          .where(eq(copies.id, copy.id));
+
+        // §8: "a hold expires while another hold is waiting" — the queue advances on return,
+        // not just on hold expiry. Check for the next queued hold on this edition/branch first.
+        const [nextHold] = await tx
+          .select()
+          .from(holds)
+          .where(
+            and(
+              eq(holds.editionId, copy.editionId),
+              eq(holds.branchId, copy.branchId),
+              eq(holds.status, "queued"),
+            ),
+          )
+          .orderBy(holds.queuePosition)
+          .limit(1);
+
+        if (nextHold) {
+          const pickupExpiresAt = new Date();
+          pickupExpiresAt.setDate(
+            pickupExpiresAt.getDate() + PICKUP_WINDOW_DAYS,
+          );
+
+          await tx
+            .update(holds)
+            .set({
+              status: "ready_for_pickup",
+              fulfilledCopyId: copy.id,
+              readyAt: new Date(),
+              pickupExpiresAt,
+            })
+            .where(eq(holds.id, nextHold.id));
+
+          // Copy stays reserved for the hold, NOT available for general checkout
+          await tx
+            .update(copies)
+            .set({ status: "on_hold", updatedAt: new Date() })
+            .where(eq(copies.id, copy.id));
+        } else {
+          await tx
+            .update(copies)
+            .set({ status: "available", updatedAt: new Date() })
+            .where(eq(copies.id, copy.id));
+        }
 
         await tx.insert(circulationEvents).values({
           organizationId: ctx.organizationId!,
