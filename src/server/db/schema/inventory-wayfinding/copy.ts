@@ -29,6 +29,9 @@ export const copies = pgTable("copies", {
   branchId: uuid("branch_id")
     .notNull()
     .references(() => branches.id),
+  pendingDestinationBranchId: uuid("pending_destination_branch_id").references(
+    () => branches.id,
+  ),
   editionId: uuid("edition_id")
     .notNull()
     .references(() => editions.id),

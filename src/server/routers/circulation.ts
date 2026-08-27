@@ -9,7 +9,7 @@ import {
   memberships,
   memberLogEvents,
   holds,
-  editions,
+  copyExpectedLocations,
 } from "@/server/db/schema";
 import { eq, and, sql } from "drizzle-orm";
 import { resolveCirculationPolicy } from "@/server/policy-engine/evaluate";
@@ -168,6 +168,277 @@ export const circulationRouter = router({
         });
 
         return { loan, replayed: false };
+      });
+    }),
+
+  renew: orgProcedure
+    .input(
+      z.object({
+        barcode: z.string(),
+        idempotencyKey: z.string(),
+      }),
+    )
+    .mutation(async ({ ctx, input }) => {
+      const [existingEvent] = await db
+        .select()
+        .from(circulationEvents)
+        .where(eq(circulationEvents.idempotencyKey, input.idempotencyKey))
+        .limit(1);
+
+      if (existingEvent) {
+        const [existingLoan] = await db
+          .select()
+          .from(loans)
+          .where(eq(loans.id, existingEvent.loanId!))
+          .limit(1);
+        return { loan: existingLoan, replayed: true };
+      }
+
+      return db.transaction(async (tx) => {
+        const [copy] = await tx
+          .select()
+          .from(copies)
+          .where(
+            and(
+              eq(copies.barcode, input.barcode),
+              eq(copies.organizationId, ctx.organizationId!),
+            ),
+          )
+          .limit(1);
+
+        if (!copy)
+          throw new TRPCError({ code: "NOT_FOUND", message: "Copy not found" });
+
+        const [activeLoan] = await tx
+          .select()
+          .from(loans)
+          .where(and(eq(loans.copyId, copy.id), eq(loans.status, "active")))
+          .limit(1);
+
+        if (!activeLoan) {
+          throw new TRPCError({
+            code: "CONFLICT",
+            message: "No active loan found for this copy",
+          });
+        }
+
+        const [waitingHold] = await tx
+          .select()
+          .from(holds)
+          .where(
+            and(
+              eq(holds.editionId, copy.editionId),
+              eq(holds.branchId, copy.branchId),
+              eq(holds.status, "queued"),
+            ),
+          )
+          .limit(1);
+
+        if (waitingHold) {
+          throw new TRPCError({
+            code: "FORBIDDEN",
+            message: "Renewal is unavailable because another member is waiting",
+          });
+        }
+
+        const [membership] = await tx
+          .select()
+          .from(memberships)
+          .where(
+            and(
+              eq(memberships.personId, activeLoan.personId),
+              eq(memberships.organizationId, ctx.organizationId!),
+            ),
+          )
+          .limit(1);
+
+        const policy = await resolveCirculationPolicy({
+          organizationId: ctx.organizationId!,
+          branchId: copy.branchId,
+          memberType: membership?.memberType ?? null,
+          resourceType: "book",
+        });
+
+        if (!policy) {
+          throw new TRPCError({
+            code: "PRECONDITION_FAILED",
+            message: "No circulation policy configured for this organization",
+          });
+        }
+
+        if (activeLoan.renewalCount >= policy.rules.renewalLimit) {
+          throw new TRPCError({
+            code: "FORBIDDEN",
+            message: `Renewal limit reached (${policy.rules.renewalLimit} renewals already used)`,
+          });
+        }
+
+        const newDueAt = new Date();
+        newDueAt.setDate(newDueAt.getDate() + policy.rules.loanPeriodDays);
+
+        const [updatedLoan] = await tx
+          .update(loans)
+          .set({
+            dueAt: newDueAt,
+            renewalCount: activeLoan.renewalCount + 1,
+          })
+          .where(eq(loans.id, activeLoan.id))
+          .returning();
+
+        await tx.insert(circulationEvents).values({
+          organizationId: ctx.organizationId!,
+          copyId: copy.id,
+          loanId: activeLoan.id,
+          eventType: "renew",
+          actorUserAccountId: ctx.userAccountId!,
+          idempotencyKey: input.idempotencyKey,
+          metadata: {
+            newDueAt: newDueAt.toISOString(),
+            renewalCount: activeLoan.renewalCount + 1,
+          },
+        });
+
+        await tx.insert(memberLogEvents).values({
+          personId: activeLoan.personId,
+          eventType: "loan_checked_out",
+          actorUserAccountId: ctx.userAccountId!,
+          summary: `Renewed copy ${copy.barcode}, new due date ${newDueAt.toLocaleDateString()}`,
+          metadata: { loanId: activeLoan.id },
+        });
+
+        return { loan: updatedLoan, replayed: false };
+      });
+    }),
+
+  initiateTransfer: orgProcedure
+    .input(
+      z.object({
+        barcode: z.string(),
+        destinationBranchId: z.string().uuid(),
+        idempotencyKey: z.string(),
+      }),
+    )
+    .mutation(async ({ ctx, input }) => {
+      const [existingEvent] = await db
+        .select()
+        .from(circulationEvents)
+        .where(eq(circulationEvents.idempotencyKey, input.idempotencyKey))
+        .limit(1);
+
+      if (existingEvent) return { replayed: true };
+
+      return db.transaction(async (tx) => {
+        const [copy] = await tx
+          .select()
+          .from(copies)
+          .where(
+            and(
+              eq(copies.barcode, input.barcode),
+              eq(copies.organizationId, ctx.organizationId!),
+            ),
+          )
+          .limit(1);
+
+        if (!copy)
+          throw new TRPCError({ code: "NOT_FOUND", message: "Copy not found" });
+
+        if (copy.status !== "available") {
+          throw new TRPCError({
+            code: "CONFLICT",
+            message: `Copy is currently "${copy.status}" — only available copies can be transferred`,
+          });
+        }
+
+        await tx
+          .update(copies)
+          .set({
+            status: "in_transit",
+            pendingDestinationBranchId: input.destinationBranchId,
+            updatedAt: new Date(),
+          })
+          .where(eq(copies.id, copy.id));
+
+        await tx.insert(circulationEvents).values({
+          organizationId: ctx.organizationId!,
+          copyId: copy.id,
+          eventType: "transfer",
+          actorUserAccountId: ctx.userAccountId!,
+          idempotencyKey: input.idempotencyKey,
+          metadata: {
+            fromBranchId: copy.branchId,
+            toBranchId: input.destinationBranchId,
+            direction: "initiated",
+          },
+        });
+
+        return { replayed: false, status: "in_transit" as const };
+      });
+    }),
+
+  receiveTransfer: orgProcedure
+    .input(
+      z.object({
+        barcode: z.string(),
+        idempotencyKey: z.string(),
+      }),
+    )
+    .mutation(async ({ ctx, input }) => {
+      const [existingEvent] = await db
+        .select()
+        .from(circulationEvents)
+        .where(eq(circulationEvents.idempotencyKey, input.idempotencyKey))
+        .limit(1);
+
+      if (existingEvent) return { replayed: true };
+
+      return db.transaction(async (tx) => {
+        const [copy] = await tx
+          .select()
+          .from(copies)
+          .where(
+            and(
+              eq(copies.barcode, input.barcode),
+              eq(copies.organizationId, ctx.organizationId!),
+            ),
+          )
+          .limit(1);
+
+        if (!copy)
+          throw new TRPCError({ code: "NOT_FOUND", message: "Copy not found" });
+
+        if (copy.status !== "in_transit" || !copy.pendingDestinationBranchId) {
+          throw new TRPCError({
+            code: "CONFLICT",
+            message: "Copy is not currently in transit",
+          });
+        }
+
+        const destinationBranchId = copy.pendingDestinationBranchId;
+
+        await tx
+          .update(copies)
+          .set({
+            branchId: destinationBranchId,
+            pendingDestinationBranchId: null,
+            status: "available",
+            updatedAt: new Date(),
+          })
+          .where(eq(copies.id, copy.id));
+
+        await tx
+          .delete(copyExpectedLocations)
+          .where(eq(copyExpectedLocations.copyId, copy.id));
+
+        await tx.insert(circulationEvents).values({
+          organizationId: ctx.organizationId!,
+          copyId: copy.id,
+          eventType: "transfer",
+          actorUserAccountId: ctx.userAccountId!,
+          idempotencyKey: input.idempotencyKey,
+          metadata: { toBranchId: destinationBranchId, direction: "received" },
+        });
+
+        return { replayed: false, status: "available" as const };
       });
     }),
 

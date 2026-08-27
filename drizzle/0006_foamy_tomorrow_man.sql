@@ -1,0 +1,2 @@
+ALTER TABLE "copies" ADD COLUMN "pending_destination_branch_id" uuid;--> statement-breakpoint
+ALTER TABLE "copies" ADD CONSTRAINT "copies_pending_destination_branch_id_branches_id_fk" FOREIGN KEY ("pending_destination_branch_id") REFERENCES "public"."branches"("id") ON DELETE no action ON UPDATE no action;
