@@ -50,6 +50,13 @@
       "when": 1787807382854,
       "tag": "0006_foamy_tomorrow_man",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1787832327264,
+      "tag": "0007_phase9_acquisitions_schema",
+      "breakpoints": true
     }
   ]
 }
